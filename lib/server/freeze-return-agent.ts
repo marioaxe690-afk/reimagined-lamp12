@@ -1,3 +1,15 @@
+/**
+ * Agent 2 — freeze-return submodule.
+ *
+ * Owns the "user freezes a card → we remind them when it makes sense to
+ * resume" loop. The frontend (FreezeReturnScheduler) drives the timing; this
+ * module drives the *decision*: keep waiting, restore the card as-is, split
+ * into a smaller restart, or fall back to a 30-minute follow-up reminder
+ * when the queue is busier than the frozen card.
+ *
+ * Sister modules in Agent 2: schedule-planner (priority + calendar/sync),
+ * schedule-agent (compat AgentScheduleAction surface).
+ */
 import type { FreezeReturnDecision, FrozenTaskEntry, QueueItem, TaskCard } from "@/lib/types";
 import { calculatePriorityVector, createQueueAction } from "@/lib/server/priority-engine";
 

@@ -23,6 +23,7 @@ import type {
   ClarificationAnswer,
   ClarifyingQuestion,
   DeckState,
+  FrozenTaskEntry,
   InputsState,
   LastCompletion,
   Mode,
@@ -93,6 +94,13 @@ type NextCardStore = {
   continueCurrentCard: () => void;
   startFocusTiming: () => void;
   startQuickBurning: () => void;
+  /**
+   * Mark a frozen-task entry as having had its return reminder fired. The
+   * matching in-app proof note is written and the entry is removed from the
+   * pending ledger. Called by FreezeReturnScheduler when the timer for an
+   * entry reaches its returnAfter timestamp.
+   */
+  triggerFreezeReturn: (entryId: string) => void;
 };
 
 type PersistedNextCardState = Partial<
@@ -127,6 +135,7 @@ const defaultDeck: DeckState = {
   frozenCardIds: [],
   rewardCards: [],
   rescheduleQueue: [],
+  frozenTasks: [],
   activeTimeMode: "idle"
 };
 
@@ -250,8 +259,18 @@ async function callImportReview(payload: Record<string, unknown>): Promise<Impor
  * The snapshot is sent in *preview* mode (no `persist`, no `dispatch`) so
  * the worker route does not overwrite server-side queue truth nor trigger
  * Web Push from the client side. See app/api/backend/worker/tick/route.ts.
+ *
+ * `frozenTasks` is now populated from the store's frozen-task ledger so the
+ * freeze-return agent (Agent 2) actually has something to sweep — without
+ * this, the "we'll remind you to come back" promise was structurally
+ * impossible to deliver because the agent always saw an empty list.
  */
-function fireWorkerTick(deck: TaskDeck, analysis: AnalysisResult | null): void {
+function fireWorkerTick(
+  deck: TaskDeck,
+  analysis: AnalysisResult | null,
+  frozenTasks: FrozenTaskEntry[],
+  options?: { dispatch?: boolean }
+): void {
   if (typeof window === "undefined") return;
   const now = new Date().toISOString();
   const queueItems = deck.cards.map((card) => ({
@@ -290,12 +309,14 @@ function fireWorkerTick(deck: TaskDeck, analysis: AnalysisResult | null): void {
       queueItems,
       activeQueue: queueItems.filter((q) => q.status === "queued" || q.status === "active").map((q) => q.id),
       timeLocks: [],
-      frozenTasks: [],
+      // Carry the local freeze-return ledger so freeze-sweep can run a real
+      // analyzeFrozenTaskReturn pass on every tick.
+      frozenTasks,
       hiddenGoals: [],
-      processedActionIds: []
-      // Note: persist=false / dispatch=false (defaults). The server will
-      // run the planner against this snapshot but won't overwrite its own
-      // queue file or send any push notifications.
+      processedActionIds: [],
+      // Default is preview-only. Callers that explicitly want the server to
+      // dispatch reminders (e.g. the freeze-return timer firing) opt in.
+      dispatch: options?.dispatch === true
     })
   }).catch(() => {
     // Intentionally swallow — this is observe-only. A failed tick must not
@@ -334,6 +355,69 @@ function getSourceType(inputs: Pick<InputsState, "text" | "attachments" | "image
 const makeProofId = () => `proof-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
 const makeRewardId = () => `reward-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
 const makeMessageId = () => `msg-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
+const makeFrozenEntryId = () => `frozen-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
+
+/**
+ * Compute when the freeze-return agent should next consider this card.
+ *
+ * Strategy (matches the alignment agreed with the user):
+ *   1. If the card has a real deadline, return 30 minutes before it.
+ *   2. Otherwise use suggestedStartAt when it lies in the future.
+ *   3. Otherwise fall back to now + 90 minutes.
+ *
+ * Past timestamps are skipped — a return reminder must always be in the
+ * future, otherwise the agent would spam the user immediately on freeze.
+ */
+function computeFreezeReturnAfter(card: TaskCard, nowMs: number): string {
+  const deadlineMs = card.deadlineAt ? new Date(card.deadlineAt).getTime() : NaN;
+  if (Number.isFinite(deadlineMs)) {
+    const guarded = deadlineMs - 30 * 60_000;
+    if (guarded > nowMs) {
+      return new Date(guarded).toISOString();
+    }
+  }
+
+  const suggestedMs = card.suggestedStartAt ? new Date(card.suggestedStartAt).getTime() : NaN;
+  if (Number.isFinite(suggestedMs) && suggestedMs > nowMs) {
+    return new Date(suggestedMs).toISOString();
+  }
+
+  return new Date(nowMs + 90 * 60_000).toISOString();
+}
+
+function buildFrozenTaskEntry(card: TaskCard, deck: TaskDeck, nowIso: string): FrozenTaskEntry {
+  const nowMs = new Date(nowIso).getTime();
+
+  return {
+    id: makeFrozenEntryId(),
+    card,
+    deckTitle: deck.coverTitle,
+    frozenAt: nowIso,
+    returnAfter: computeFreezeReturnAfter(card, nowMs),
+    reason: "用户主动冻结，agent 将在 returnAfter 时点重新评估是否恢复。",
+    minReentryMinutes: Math.max(3, Math.min(card.estimatedMinutes, 10)),
+    contextSnapshot: [
+      card.action,
+      card.encouragement,
+      card.cardBackNote
+    ].filter(Boolean)
+  };
+}
+
+/**
+ * Render a returnAfter ISO string in the user's local time, used in proof
+ * notes and reminder copy. Falls back to the raw ISO if the input is unusable.
+ */
+function formatReturnLabel(returnAfter: string): string {
+  const date = new Date(returnAfter);
+  if (Number.isNaN(date.getTime())) return returnAfter;
+  return date.toLocaleString("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
 
 function getActualMinutes(card: TaskCard) {
   const startedSeconds = card.startedAt
@@ -1242,6 +1326,48 @@ export const useNextCardStore = create<NextCardStore>()(
           };
         }),
       startQuickBurning: () => get().failCurrentDeckByBurn(),
+      triggerFreezeReturn: (entryId: string) => {
+        const state = get();
+        const entry = state.deck.frozenTasks.find((item) => item.id === entryId);
+        if (!entry) {
+          return;
+        }
+
+        const remaining = state.deck.frozenTasks.filter((item) => item.id !== entryId);
+        const proofRecord: ProofRecord = {
+          id: makeProofId(),
+          deckId: entry.card.deckId,
+          cardId: entry.card.id,
+          goalTitle: entry.deckTitle,
+          source: state.inputs.sourceType,
+          status: "in-progress",
+          progress: 0,
+          completedCards: 0,
+          frozenCards: state.deck.frozenCardIds.length,
+          actualMinutes: 0,
+          timeStatus: "frozen-rescheduled",
+          timeDamageEvents: [
+            `冻结回归提醒触发：${formatReturnLabel(entry.returnAfter)}`,
+            `建议先做 ${entry.minReentryMinutes} 分钟内的最小动作。`
+          ],
+          lastDamageEffect: "freeze",
+          lastAction: `回归提醒：${entry.card.title}`,
+          nextSuggestion: `打开 deck，先恢复「${entry.card.title}」的上下文。`,
+          createdAt: new Date().toISOString()
+        };
+        const records = [proofRecord, ...state.proofs.records];
+
+        set({
+          deck: {
+            ...state.deck,
+            frozenTasks: remaining
+          },
+          proofs: {
+            records,
+            summaryDocument: mockGenerateProofSummary(records)
+          }
+        });
+      },
       continueCurrentCard: () =>
         set((state) => ({
           deck: {
@@ -1279,6 +1405,16 @@ export const useNextCardStore = create<NextCardStore>()(
             cards,
             completedCards: cards.filter((card) => card.status === "completed" || card.status === "rewarded").length
           };
+
+          // Register each freshly frozen card with the freeze-return agent.
+          // Without these entries the agent has nothing to sweep, and the
+          // promised "we'll remind you to come back" never fires.
+          const nowIso = new Date().toISOString();
+          const newFrozenEntries: FrozenTaskEntry[] = cards
+            .filter((card) => card.status === "frozen" && !state.deck.frozenTasks.some((entry) => entry.card.id === card.id))
+            .map((card) => buildFrozenTaskEntry(card, updatedDeck, nowIso));
+          const frozenTasks = [...state.deck.frozenTasks, ...newFrozenEntries];
+
           const proofRecord: ProofRecord = {
             id: makeProofId(),
             deckId: activeDeck.id,
@@ -1288,11 +1424,19 @@ export const useNextCardStore = create<NextCardStore>()(
             ...getDeckProofProgress(updatedDeck, frozenIds.length),
             actualMinutes: currentCard ? getActualMinutes(currentCard) : getDeckActualMinutes(activeDeck.cards),
             timeStatus: "frozen-rescheduled",
-            timeDamageEvents: ["右滑冻结整组任务,停止后续卡片打卡"],
+            timeDamageEvents: [
+              "右滑冻结整组任务,停止后续卡片打卡",
+              newFrozenEntries.length > 0
+                ? `已为 ${newFrozenEntries.length} 张卡安排回归提醒,最近一次将在 ${formatReturnLabel(newFrozenEntries[0].returnAfter)}`
+                : "冻结任务已登记,等待回归窗口"
+            ],
             lastDamageEffect: "freeze",
             lastAction: `冻结任务:${activeDeck.coverTitle}`,
-            nextSuggestion: "任务已冻结在后台。需要恢复时,从任务记录重新规划,不继续当前卡组。",
-            createdAt: new Date().toISOString()
+            nextSuggestion:
+              newFrozenEntries.length > 0
+                ? `到点会主动提醒你回到这张卡(${formatReturnLabel(newFrozenEntries[0].returnAfter)})`
+                : "任务已冻结在后台。需要恢复时可手动新建。",
+            createdAt: nowIso
           };
           const records = [proofRecord, ...state.proofs.records];
 
@@ -1303,6 +1447,7 @@ export const useNextCardStore = create<NextCardStore>()(
               decks: replaceDeck(state.deck.decks, updatedDeck),
               currentCardId: null,
               frozenCardIds,
+              frozenTasks,
               rescheduleQueue: Array.from(new Set([...state.deck.rescheduleQueue, activeDeck.id])),
               activeTimeMode: "idle"
             },
@@ -1317,7 +1462,7 @@ export const useNextCardStore = create<NextCardStore>()(
         const after = get();
         const activeDeck = after.deck.decks.find((d) => d.id === after.deck.activeDeckId);
         if (activeDeck) {
-          fireWorkerTick(activeDeck, after.analysis);
+          fireWorkerTick(activeDeck, after.analysis, after.deck.frozenTasks);
         }
       },
       completeCurrentCard: (direction) => {
@@ -1435,16 +1580,35 @@ export const useNextCardStore = create<NextCardStore>()(
         const after = get();
         const activeDeck = after.deck.decks.find((d) => d.id === after.deck.activeDeckId);
         if (activeDeck) {
-          fireWorkerTick(activeDeck, after.analysis);
+          fireWorkerTick(activeDeck, after.analysis, after.deck.frozenTasks);
         }
       }
     }),
     {
       name: "next-card-mvp",
-      version: 3,
-      migrate: (persistedState) => persistedState as PersistedNextCardState,
+      version: 4,
+      migrate: (persistedState) => {
+        const persisted = persistedState as PersistedNextCardState;
+        if (persisted?.deck && !Array.isArray((persisted.deck as DeckState).frozenTasks)) {
+          // v3 → v4: backfill the freeze-return ledger introduced for Agent 2.
+          // Existing decks have no entries; new freezes will populate it.
+          return {
+            ...persisted,
+            deck: { ...persisted.deck, frozenTasks: [] }
+          } as PersistedNextCardState;
+        }
+        return persisted;
+      },
       merge: (persistedState, currentState) => {
         const persisted = persistedState as PersistedNextCardState;
+        const persistedDeck = persisted.deck
+          ? {
+              ...persisted.deck,
+              frozenTasks: Array.isArray((persisted.deck as DeckState).frozenTasks)
+                ? (persisted.deck as DeckState).frozenTasks
+                : []
+            }
+          : currentState.deck;
 
         return {
           ...currentState,
@@ -1453,7 +1617,7 @@ export const useNextCardStore = create<NextCardStore>()(
           analysisStatus: persisted.analysisStatus ?? currentState.analysisStatus,
           plans: persisted.plans ?? currentState.plans,
           taskFlow: persisted.taskFlow ?? currentState.taskFlow,
-          deck: persisted.deck ?? currentState.deck,
+          deck: persistedDeck,
           proofs: persisted.proofs ?? currentState.proofs,
           mode: "input",
           activeOverlay: null,

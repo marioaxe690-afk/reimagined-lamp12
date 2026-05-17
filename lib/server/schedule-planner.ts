@@ -1,3 +1,20 @@
+/**
+ * Agent 2 — schedule-planner submodule.
+ *
+ * Agent 2 covers the full "task time scheduling + push" surface:
+ *   - 冻结回归提醒 (freeze-return-agent + FreezeReturnScheduler)
+ *   - 优先级排序 (this file + priority-engine)
+ *   - 通用 reminder/calendar 同步 (this file → provider-dispatch)
+ *   - ICS 日历事件 (ics-calendar-provider)
+ *   - 非冻结类的 urgency-threshold reminder (this file)
+ *   - 隐藏目标 reveal (this file)
+ *
+ * The frontend's `fireWorkerTick` is the single integration point: it
+ * forwards the deck snapshot + AI analysis (Agent 1) so this planner can
+ * decide what to insert/move/deal/remind. Provider dispatch only fires when
+ * the worker tick route is called with `dispatch: true` (e.g. from
+ * FreezeReturnScheduler at returnAfter time).
+ */
 import type { LockedConflict, QueueAction, QueueItem, SchedulePlannerInput, SchedulePlannerOutput } from "@/lib/types";
 import { calculatePriorityVector, createQueueAction, getItemLocks, hasHardTimeLock } from "@/lib/server/priority-engine";
 

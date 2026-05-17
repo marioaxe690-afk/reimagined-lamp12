@@ -2,6 +2,7 @@
 
 import { motion } from "framer-motion";
 import { AppOverlayHost } from "@/components/AppOverlayHost";
+import { FreezeReturnScheduler } from "@/components/FreezeReturnScheduler";
 import { TopModeTabs } from "@/components/TopModeTabs";
 import { DeckLibrary } from "@/components/deck/DeckLibrary";
 import { InputComposer } from "@/components/input/InputComposer";
@@ -46,6 +47,7 @@ export default function Home() {
         )}
       </div>
       <AppOverlayHost />
+      <FreezeReturnScheduler />
     </main>
   );
 }

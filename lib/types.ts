@@ -234,6 +234,13 @@ export type DeckState = {
   frozenCardIds: string[];
   rewardCards: RewardCard[];
   rescheduleQueue: string[];
+  /**
+   * Frozen-task ledger: every entry represents one card the user chose to
+   * freeze and the time at which the freeze-return agent should consider
+   * surfacing it again. Persisted alongside the deck so reminders survive
+   * reloads.
+   */
+  frozenTasks: FrozenTaskEntry[];
   activeTimeMode: "idle" | "timing" | "burning" | "paused";
 };
 

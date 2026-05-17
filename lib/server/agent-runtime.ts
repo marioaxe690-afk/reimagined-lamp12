@@ -1,3 +1,18 @@
+/**
+ * Agent 2 — runtime plan + skill registry.
+ *
+ * This module is the declarative spine of Agent 2's scheduling surface. It
+ * enumerates skills (goal-plan / multimodal-import / coverage-review /
+ * review-gate / priority-score / time-lock-guard / schedule-insert /
+ * freeze-return / hidden-goal-reveal / reminder-calendar-sync / ...) and the
+ * triggers (goal-submitted, worker-tick, freeze-return-due, urgency-threshold,
+ * card-completed) that fan them out.
+ *
+ * `applyAgentRuntimeGuard` is the live binding consumed by backend-worker.ts:
+ * it filters QueueAction kinds against the trigger's allowlist and flags
+ * anything outside it as requiresUserReview, so `worker-tick` cannot, e.g.,
+ * silently mint a reveal-hidden-goal action that bypasses the review-gate.
+ */
 import type { AgentId, QueueActionKind, SourceType } from "@/lib/types";
 
 export type AgentRuntimeLayer = "mimo-backend" | "queue-orchestrator" | "behavior-profile" | "provider-dispatch";
