@@ -435,3 +435,32 @@ function buildRuntimeGuards(skillOrder: AgentSkillId[]) {
 
   return guards;
 }
+
+/**
+ * Apply the runtime plan's guards and allowed queue actions to a freshly
+ * produced QueueAction[]. Anything outside the trigger's `queueActions`
+ * allowlist gets flagged as requiresUserReview, matching the AGENT_AUTO_TRIGGERS
+ * declaration: a `worker-tick` may produce reminders/calendar/insert/move/deal,
+ * but a `card-completed` should not silently mint reminders.
+ *
+ * This is the binding that finally makes agent-runtime.ts a runtime instead of
+ * a documentation-only artifact — schedule-planner / freeze-sweep / worker
+ * call this on every batch of actions before dispatch.
+ */
+export function applyAgentRuntimeGuard<T extends { kind: import("@/lib/types").QueueActionKind; requiresUserReview: boolean }>(
+  actions: T[],
+  plan: AgentRuntimePlan
+): T[] {
+  const allowed = new Set(plan.queueActions);
+
+  return actions.map((action) => {
+    if (allowed.has(action.kind)) {
+      return action;
+    }
+
+    return {
+      ...action,
+      requiresUserReview: true
+    };
+  });
+}

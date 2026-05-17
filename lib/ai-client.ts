@@ -1,4 +1,4 @@
-import type { AIReplyPayload, ChatMessage, SourceType } from "@/lib/types";
+import type { AIReplyPayload, ChatMessage, PlanOption, SourceType } from "@/lib/types";
 
 export type ChatApiResponse = {
   payload: AIReplyPayload;
@@ -10,6 +10,8 @@ export type ChatApiContext = {
   contextNote?: string;
   sourceType?: SourceType;
   parsedText?: string;
+  regenerate?: boolean;
+  previousPlans?: PlanOption[];
 };
 
 export async function callChatApi(
@@ -25,7 +27,9 @@ export async function callChatApi(
       messages,
       contextNote: ctx.contextNote,
       sourceType: ctx.sourceType,
-      parsedText: ctx.parsedText
+      parsedText: ctx.parsedText,
+      regenerate: ctx.regenerate === true ? true : undefined,
+      previousPlans: ctx.previousPlans && ctx.previousPlans.length > 0 ? ctx.previousPlans : undefined
     })
   });
 

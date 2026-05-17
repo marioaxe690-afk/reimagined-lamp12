@@ -168,6 +168,12 @@ export type TurnBudget = {
   total: number;
 };
 
+// Single source of truth for the clarification turn budget. The system prompt
+// above says "5 轮", the frontend store enforces it via enforceTurnBudget,
+// and the compat /api/ai/clarify entry uses it as the message cap. Keep these
+// in sync by importing this constant.
+export const CLARIFICATION_TURN_BUDGET = 5;
+
 export function buildContextNote(inputs: InputsState, turnBudget?: TurnBudget): string {
   const parts: string[] = [];
 

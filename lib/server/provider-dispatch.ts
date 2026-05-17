@@ -18,6 +18,21 @@ export async function dispatchProviderActions(
   const results: ProviderDispatchResult[] = [];
 
   for (const action of actions) {
+    // Actions that the planner flagged for human review must not silently
+    // hit Web Push or the calendar provider. We surface them as `skipped`
+    // so the caller (worker tick / dashboard) can show them in a review
+    // queue instead of dispatching them on the user's behalf.
+    if (action.requiresUserReview) {
+      results.push({
+        actionId: action.id,
+        targetId: action.targetId,
+        provider: action.kind === "create-calendar-event" || action.kind === "update-calendar-event" ? "calendar" : "notification",
+        status: "skipped",
+        error: "requires-user-review"
+      });
+      continue;
+    }
+
     if (action.kind === "create-reminder" || action.kind === "update-reminder") {
       results.push(await dispatchNotification(action, ports));
       continue;

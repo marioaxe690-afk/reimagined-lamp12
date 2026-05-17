@@ -13,7 +13,7 @@ import {
   mockRegeneratePlanOptions
 } from "@/lib/mock-ai";
 import { callChatApi } from "@/lib/ai-client";
-import { buildContextNote } from "@/lib/ai-prompts";
+import { buildContextNote, CLARIFICATION_TURN_BUDGET } from "@/lib/ai-prompts";
 import type {
   ActiveOverlay,
   AIReplyPayload,
@@ -40,7 +40,7 @@ import type {
   UploadedImage
 } from "@/lib/types";
 
-const TURN_BUDGET_TOTAL = 5;
+const TURN_BUDGET_TOTAL = CLARIFICATION_TURN_BUDGET;
 
 type NextCardStore = {
   mode: Mode;
@@ -246,20 +246,39 @@ async function callImportReview(payload: Record<string, unknown>): Promise<Impor
  * state is still managed locally by useNextCardStore. This call ensures the
  * server-side scheduling pipeline is exercised (and logged) on every
  * meaningful change, which lets us verify the path is live.
+ *
+ * The snapshot is sent in *preview* mode (no `persist`, no `dispatch`) so
+ * the worker route does not overwrite server-side queue truth nor trigger
+ * Web Push from the client side. See app/api/backend/worker/tick/route.ts.
  */
-function fireWorkerTick(deckCards: Array<{ id: string; status: string; estimatedMinutes: number; deadlineAt?: string }>): void {
+function fireWorkerTick(deck: TaskDeck, analysis: AnalysisResult | null): void {
   if (typeof window === "undefined") return;
   const now = new Date().toISOString();
-  const queueItems = deckCards.map((card) => ({
+  const queueItems = deck.cards.map((card) => ({
     id: card.id,
-    title: card.id,
+    title: card.title,
     kind: "card" as const,
-    status: card.status === "frozen" ? ("frozen" as const) : card.status === "completed" || card.status === "rewarded" ? ("completed" as const) : ("queued" as const),
-    source: "text" as const,
+    status:
+      card.status === "frozen"
+        ? ("frozen" as const)
+        : card.status === "completed" || card.status === "rewarded"
+          ? ("completed" as const)
+          : card.status === "active"
+            ? ("active" as const)
+            : ("queued" as const),
+    source: analysis?.sourceType ?? ("text" as const),
     createdAt: now,
     estimatedMinutes: card.estimatedMinutes ?? 8,
-    deadlineAt: card.deadlineAt,
-    urgencyStage: "calm" as const,
+    deadlineAt: card.deadlineAt ?? undefined,
+    suggestedStartAt: card.suggestedStartAt ?? undefined,
+    urgencyStage: card.urgencyStage,
+    deckId: deck.id,
+    cardId: card.id,
+    // Forward the AI-derived behavior vector so the priority engine and
+    // schedule-planner actually see Agent 1's analysis. Without this, the
+    // priority calculation regressed to default fallbacks every tick — the
+    // two agents shared a data contract on paper only.
+    behaviorVector: analysis?.behaviorVector,
     timeLocks: []
   }));
 
@@ -269,11 +288,14 @@ function fireWorkerTick(deckCards: Array<{ id: string; status: string; estimated
     body: JSON.stringify({
       now,
       queueItems,
-      activeQueue: queueItems.filter((q) => q.status === "queued").map((q) => q.id),
+      activeQueue: queueItems.filter((q) => q.status === "queued" || q.status === "active").map((q) => q.id),
       timeLocks: [],
       frozenTasks: [],
       hiddenGoals: [],
       processedActionIds: []
+      // Note: persist=false / dispatch=false (defaults). The server will
+      // run the planner against this snapshot but won't overwrite its own
+      // queue file or send any push notifications.
     })
   }).catch(() => {
     // Intentionally swallow — this is observe-only. A failed tick must not
@@ -571,7 +593,7 @@ function enforceTurnBudget(
   return payload;
 }
 
-async function requestAiTurn(get: StoreGet, set: StoreSet): Promise<void> {
+async function requestAiTurn(get: StoreGet, set: StoreSet, opts?: { regenerate?: boolean }): Promise<void> {
   const state = get();
   const turnBudget = { used: state.turnCount, total: TURN_BUDGET_TOTAL };
   const contextNote = buildContextNote(state.inputs, turnBudget);
@@ -580,7 +602,9 @@ async function requestAiTurn(get: StoreGet, set: StoreSet): Promise<void> {
     const { payload: rawPayload, fallback } = await callChatApi(state.messages, {
       contextNote,
       sourceType: state.inputs.sourceType,
-      parsedText: state.inputs.parsedText
+      parsedText: state.inputs.parsedText,
+      regenerate: opts?.regenerate === true,
+      previousPlans: opts?.regenerate === true ? state.plans.options : undefined
     });
     const payload = enforceTurnBudget(rawPayload, state.turnCount, state.messages);
 
@@ -1009,11 +1033,13 @@ export const useNextCardStore = create<NextCardStore>()(
           createdAt: new Date().toISOString()
         };
 
-        const fallbackOptions = mockRegeneratePlanOptions(
-          state.inputs,
-          state.plans.options,
-          state.clarificationAnswer
-        );
+        // Snapshot the current plans so the backend can use them as the
+        // "previous plans" seed when truly regenerating, instead of
+        // returning the same three options. We clear the visible options
+        // so the user sees a regenerating state until the backend replies;
+        // if the backend fails, the catch path in requestAiTurn will fall
+        // back to the local mock without us pre-populating the slot here.
+        const previousOptions = state.plans.options;
 
         set({
           analysisStatus: "generating",
@@ -1022,14 +1048,38 @@ export const useNextCardStore = create<NextCardStore>()(
           aiFallback: false,
           plans: {
             ...state.plans,
-            options: fallbackOptions,
+            options: [],
             selectedPlanId: null,
             regenerateCount: state.plans.regenerateCount + 1
           },
           taskFlow: null
         });
 
-        void requestAiTurn(get, set);
+        // Mark this as a regenerate turn so the chat API actually rerolls
+        // labels/timings via mockRegeneratePlanOptions instead of returning
+        // the identical seed. If both backend providers are unreachable the
+        // catch handler will keep the user from getting stuck.
+        void requestAiTurn(get, set, { regenerate: true }).then(() => {
+          // If the backend somehow returned no plans (e.g. it stayed in
+          // asking despite this being a regenerate), restore the local
+          // regenerated mock so the UI does not look frozen.
+          const after = get();
+          if (after.plans.options.length === 0) {
+            const fallback = mockRegeneratePlanOptions(
+              after.inputs,
+              previousOptions,
+              after.clarificationAnswer
+            );
+            set((current) => ({
+              plans: {
+                ...current.plans,
+                options: fallback,
+                selectedPlanId: null
+              },
+              analysisStatus: current.analysisStatus === "generating" ? "ready" : current.analysisStatus
+            }));
+          }
+        });
       },
       selectPlan: (planId) => {
         const state = get();
@@ -1267,12 +1317,7 @@ export const useNextCardStore = create<NextCardStore>()(
         const after = get();
         const activeDeck = after.deck.decks.find((d) => d.id === after.deck.activeDeckId);
         if (activeDeck) {
-          fireWorkerTick(activeDeck.cards.map((c) => ({
-            id: c.id,
-            status: c.status,
-            estimatedMinutes: c.estimatedMinutes,
-            deadlineAt: c.deadlineAt ?? undefined
-          })));
+          fireWorkerTick(activeDeck, after.analysis);
         }
       },
       completeCurrentCard: (direction) => {
@@ -1390,12 +1435,7 @@ export const useNextCardStore = create<NextCardStore>()(
         const after = get();
         const activeDeck = after.deck.decks.find((d) => d.id === after.deck.activeDeckId);
         if (activeDeck) {
-          fireWorkerTick(activeDeck.cards.map((c) => ({
-            id: c.id,
-            status: c.status,
-            estimatedMinutes: c.estimatedMinutes,
-            deadlineAt: c.deadlineAt ?? undefined
-          })));
+          fireWorkerTick(activeDeck, after.analysis);
         }
       }
     }),

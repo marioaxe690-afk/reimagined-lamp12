@@ -1,3 +1,4 @@
+import { CLARIFICATION_TURN_BUDGET } from "@/lib/ai-prompts";
 import { mockAnalyzeInput, mockGenerateDeckFromPlan, mockGeneratePlanOptions, mockGenerateTaskFlow } from "@/lib/mock-ai";
 import { backendPorts } from "@/lib/server/backend-services";
 import { createImportReview } from "@/lib/server/import-coverage";
@@ -68,7 +69,7 @@ export type CompatParsedInputResult = {
   review: ImportReviewResult;
 };
 
-const MAX_CLARIFICATION_ROUNDS = 10;
+const MAX_CLARIFICATION_ROUNDS = CLARIFICATION_TURN_BUDGET;
 const MAX_CLARIFICATION_MESSAGES = MAX_CLARIFICATION_ROUNDS * 2;
 
 export async function createCompatPlanningBundle(inputs: InputsState): Promise<CompatPlanningBundle> {
@@ -158,7 +159,7 @@ export async function createCompatClarificationTurn(request: CompatClarification
     questionCount: messages.filter((message) => message.role !== "user").length,
     maxRounds: MAX_CLARIFICATION_ROUNDS,
     contextSummary: buildContextSummary(inputs, messages),
-    notices: forceReady ? ["已达到 10 轮澄清上限，自动进入规划。"] : [],
+    notices: forceReady ? [`已达到 ${MAX_CLARIFICATION_ROUNDS} 轮澄清上限，自动进入规划。`] : [],
     planMode: {
       ...planMode,
       status: shouldPlan ? "ready-to-build" : planMode.status,

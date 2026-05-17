@@ -40,7 +40,14 @@ export function analyzeFrozenTaskReturn(input: {
         priority: priorityVector.score,
         scheduledFor: addMinutes(input.now, 30),
         now: input.now,
-        reason: "当前队列有更急任务，冻结卡先保留上下文并创建稍后提醒。"
+        reason: "当前队列有更急任务，冻结卡先保留上下文并创建稍后提醒。",
+        // Push payload context so the user sees why a reminder is firing.
+        // AGENTS.md expects reminders to convey state (frozen / burning) and
+        // a gentle next action, not just the goal title.
+        payload: {
+          title: `稍后再处理：${input.entry.card.title}`,
+          body: `「${input.entry.deckTitle}」里的冻结卡先放着，30 分钟后再看是否恢复。`
+        }
       }),
       reason: `当前队列存在更急任务「${urgentCurrent.item.title}」，暂不覆盖发牌。`,
       priorityVector

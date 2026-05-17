@@ -80,6 +80,13 @@ export function createSchedulePlan(input: SchedulePlannerInput): SchedulePlanner
     }
 
     if (item.reminderSync === "wanted" || vector.urgency >= 90) {
+      // The user explicitly opted in for reminders (`wanted`/`synced`) → the
+      // planner can mint a reminder action that dispatches without review.
+      // Pure urgency-driven reminders (no opt-in) are still proposed but
+      // marked `requiresUserReview: true` so provider-dispatch refuses to
+      // silently push notifications on the user's behalf.
+      const userOptedIn = item.reminderSync === "wanted" || item.reminderSync === "synced";
+
       actions.push(
         createQueueAction({
           kind: item.reminderSync === "synced" ? "update-reminder" : "create-reminder",
@@ -88,7 +95,18 @@ export function createSchedulePlan(input: SchedulePlannerInput): SchedulePlanner
           priority: vector.score,
           scheduledFor: item.suggestedStartAt ?? item.deadlineAt ?? input.now,
           now: input.now,
-          reason: "时间压力达到提醒阈值，需要后端通知动作。"
+          reason: userOptedIn
+            ? "时间压力达到提醒阈值，需要后端通知动作。"
+            : "紧急度触发自动提醒，先 review 再发送以避免静默推送。",
+          requiresUserReview: !userOptedIn,
+          payload: {
+            // Provide push body/title context so Web Push doesn't fall back to
+            // bare action.title — AGENTS.md "Burning requirements" expects
+            // notifications to convey state (burning/expired/frozen) and a
+            // gentle action hint, not just a goal name.
+            title: buildReminderTitle(item),
+            body: buildReminderBody(item, vector.urgency, userOptedIn)
+          }
         })
       );
     }
@@ -194,4 +212,40 @@ function dedupeActions(actions: QueueAction[]) {
     seen.add(action.id);
     return true;
   });
+}
+
+function buildReminderTitle(item: QueueItem) {
+  const stage = item.urgencyStage;
+  const prefix =
+    stage === "burning" || stage === "expired"
+      ? "需要现在动一下"
+      : stage === "hot"
+        ? "时间窗口快关了"
+        : item.status === "frozen"
+          ? "冻结卡可以恢复"
+          : "Next Card";
+
+  return `${prefix}：${item.title}`;
+}
+
+function buildReminderBody(item: QueueItem, urgency: number, userOptedIn: boolean) {
+  const fragments: string[] = [];
+
+  if (item.status === "frozen") {
+    fragments.push(`冻结卡建议先做 ${Math.max(3, Math.min(item.estimatedMinutes, 10))} 分钟内的最小动作。`);
+  } else if (item.urgencyStage === "burning") {
+    fragments.push(`正在燃烧窗口：${item.estimatedMinutes} 分钟内能动一下吗？`);
+  } else if (item.urgencyStage === "expired") {
+    fragments.push("已过最佳窗口，先决定继续还是重新安排。");
+  } else if (item.urgencyStage === "hot") {
+    fragments.push(`时间快不够了，先做 ${item.estimatedMinutes} 分钟内的小动作。`);
+  } else {
+    fragments.push(`建议在 ${item.estimatedMinutes} 分钟内开始这张卡。`);
+  }
+
+  if (!userOptedIn && urgency >= 90) {
+    fragments.push("（这条提醒由 agent 主动建议，先 review 再决定。）");
+  }
+
+  return fragments.join(" ");
 }

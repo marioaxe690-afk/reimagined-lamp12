@@ -1,3 +1,4 @@
+import { createQueueAction } from "@/lib/server/priority-engine";
 import type { QueueAction, TaskCard, TaskDeck } from "@/lib/types";
 
 export type ScheduleActionKind =
@@ -68,9 +69,21 @@ export function createFreezeReminderAction({
   now?: string;
   timezone?: string;
 }): AgentScheduleAction {
-  const fallback = new Date(now);
-  fallback.setMinutes(fallback.getMinutes() + 90);
-  const scheduledAt = card.suggestedStartAt ?? card.deadlineAt ?? fallback.toISOString();
+  const nowMs = new Date(now).getTime();
+  // Default fallback: 90 minutes after `now` so a freshly frozen card has
+  // breathing room before the agent surfaces it again.
+  const fallbackMs = nowMs + 90 * 60_000;
+
+  // Pick the latest of the candidate timestamps that is still in the future.
+  // Using `card.suggestedStartAt` or `card.deadlineAt` blindly produces a
+  // scheduledAt in the past for cards whose start window or deadline has
+  // already elapsed (extremely common for frozen cards) — and validateScheduleAction
+  // would then reject the very action this factory just produced.
+  const futureCandidates = [card.suggestedStartAt, card.deadlineAt]
+    .map((value) => (value ? new Date(value).getTime() : NaN))
+    .filter((ms) => Number.isFinite(ms) && ms > nowMs) as number[];
+  const scheduledMs = futureCandidates.length > 0 ? Math.min(...futureCandidates) : fallbackMs;
+  const scheduledAt = new Date(scheduledMs).toISOString();
 
   return {
     id: makeScheduleId(),
@@ -144,8 +157,11 @@ export function toQueueAction(action: AgentScheduleAction): QueueAction | null {
     return null;
   }
 
-  return {
-    id: `compat:${action.id}`,
+  // Use the canonical createQueueAction so the resulting QueueAction matches
+  // the shape used by schedule-planner and freeze-return-agent. This is the
+  // bridge that lets /api/agent/schedule proposals share the same dispatch
+  // path (and review semantics) as the rest of the system.
+  return createQueueAction({
     kind: queueKind,
     targetId: action.target.id,
     title: action.title,
@@ -157,10 +173,33 @@ export function toQueueAction(action: AgentScheduleAction): QueueAction | null {
       channel: action.channel,
       sourceActionId: action.id
     },
+    now: action.createdAt,
     reason: action.agentDecision.reason,
     confidence: action.agentDecision.confidence,
     requiresUserReview: action.agentDecision.requiresUserConfirmation,
-    respectsLocks: true,
-    createdAt: action.createdAt
-  };
+    suffix: "compat"
+  });
+}
+
+/**
+ * Build a freeze-return reminder QueueAction directly. This is the canonical
+ * helper now that schedule-agent and freeze-return-agent both target the same
+ * QueueAction shape; previous AgentScheduleAction wrappers can still be built
+ * via createFreezeReminderAction + toQueueAction for the older /api/agent/schedule
+ * surface.
+ */
+export function buildFreezeReminderQueueAction(input: {
+  card: TaskCard;
+  deck: TaskDeck;
+  now?: string;
+  timezone?: string;
+}): QueueAction {
+  const action = createFreezeReminderAction(input);
+  const queueAction = toQueueAction(action);
+
+  if (!queueAction) {
+    throw new Error("createFreezeReminderAction produced an unmappable QueueAction kind");
+  }
+
+  return queueAction;
 }

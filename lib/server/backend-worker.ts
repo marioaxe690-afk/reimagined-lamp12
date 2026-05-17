@@ -1,4 +1,5 @@
 import type { BackendWorkerSnapshot, BackendWorkerTickResult, FreezeReturnDecision, QueueAction } from "@/lib/types";
+import { applyAgentRuntimeGuard, buildAgentRuntimePlan } from "@/lib/server/agent-runtime";
 import { runFreezeReturnSweep } from "@/lib/server/freeze-sweep";
 import { createSchedulePlan } from "@/lib/server/schedule-planner";
 
@@ -17,7 +18,7 @@ export function runBackendWorkerTick(snapshot: BackendWorkerSnapshot): BackendWo
   });
   const allActions = [...schedule.actions, ...freezeDecisions.map((decision) => decision.action)];
   const skippedActionIds: string[] = [];
-  const actions = allActions.filter((action) => {
+  const filteredActions = allActions.filter((action) => {
     if (snapshot.processedActionIds.includes(action.id)) {
       skippedActionIds.push(action.id);
       return false;
@@ -25,6 +26,16 @@ export function runBackendWorkerTick(snapshot: BackendWorkerSnapshot): BackendWo
 
     return true;
   });
+
+  // Apply the runtime plan: actions whose kind is not in the worker-tick
+  // trigger's allowlist get auto-flagged as requiresUserReview so dispatch
+  // (provider-dispatch) treats them as proposals, not silent push events.
+  const runtimePlan = buildAgentRuntimePlan({
+    trigger: "worker-tick",
+    agentId: "balanced-coach",
+    now: snapshot.now
+  });
+  const actions = applyAgentRuntimeGuard(filteredActions, runtimePlan);
 
   return {
     tickId: `worker-${snapshot.now.replaceAll(":", "-").replaceAll(".", "-").replace("Z", "")}`,

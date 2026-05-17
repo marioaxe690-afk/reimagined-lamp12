@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { NEXT_CARD_SYSTEM_PROMPT } from "@/lib/ai-prompts";
-import { mockAnalyzeInput, mockGeneratePlanOptions } from "@/lib/mock-ai";
+import { mockAnalyzeInput, mockGeneratePlanOptions, mockRegeneratePlanOptions } from "@/lib/mock-ai";
 import { backendPorts } from "@/lib/server/backend-services";
 import { resolveMimoProviderConfig } from "@/lib/server/providers/mimo-ai-provider";
 import type {
@@ -22,6 +22,8 @@ type ChatRequestBody = {
   contextNote?: string;
   sourceType?: SourceType;
   parsedText?: string;
+  regenerate?: boolean;
+  previousPlans?: PlanOption[];
 };
 
 type ChatProvider = "mimo" | "deepseek" | "local";
@@ -103,7 +105,9 @@ async function callPlanModeChat(body: ChatRequestBody, latestUserText: string) {
     payload: planModeToAiReplyPayload(result, {
       inputText: latestUserText,
       sourceType,
-      parsedText
+      parsedText,
+      regenerate: body.regenerate === true,
+      previousPlans: Array.isArray(body.previousPlans) ? body.previousPlans : []
     }),
     fallback: !providerConfigured,
     provider: providerConfigured ? ("mimo" as const) : ("local" as const)
@@ -148,7 +152,9 @@ async function callDeepSeekChat(body: ChatRequestBody) {
       payload: normalizeAiReplyPayload(parsePayload(content), {
         inputText: getLatestUserText(body.messages) || "当前目标",
         sourceType: body.sourceType ?? "text",
-        parsedText: [body.parsedText, body.contextNote].filter(Boolean).join("\n")
+        parsedText: [body.parsedText, body.contextNote].filter(Boolean).join("\n"),
+        regenerate: body.regenerate === true,
+        previousPlans: Array.isArray(body.previousPlans) ? body.previousPlans : []
       }),
       fallback: false,
       provider: "deepseek" as const
@@ -160,17 +166,18 @@ async function callDeepSeekChat(body: ChatRequestBody) {
 
 function planModeToAiReplyPayload(
   result: PlanModeTurnResult,
-  input: { inputText: string; sourceType: SourceType; parsedText: string }
+  input: { inputText: string; sourceType: SourceType; parsedText: string; regenerate?: boolean; previousPlans?: PlanOption[] }
 ): AIReplyPayload {
   const nextPhase = result.status === "ready-to-build" ? "ready" : "asking";
   const missing = result.analysis.missingInformation;
   const buildOptions = result.options.filter((option) => option.kind === "build");
-  // Always emit plans when the planner has any build options, even if the
-  // turn is still in `asking`. The frontend can preview them; otherwise the
-  // store falls back to mock plans which look identical for every user.
-  const plans = buildOptions.length > 0
-    ? mergeProviderPlans(input, buildOptions.slice(0, 3))
-    : null;
+  // Only emit plans once the planner is actually ready to build. Returning
+  // plans during `asking` violates AGENTS.md "先理解、再反问、再发牌" — users
+  // would see three options before they answered the clarifying question.
+  const plans =
+    nextPhase === "ready" && buildOptions.length > 0
+      ? mergeProviderPlans(input, buildOptions.slice(0, 3), input.regenerate ? input.previousPlans : undefined)
+      : null;
 
   return {
     reply:
@@ -200,7 +207,8 @@ function planModeToAiReplyPayload(
 
 function mergeProviderPlans(
   input: { inputText: string; sourceType: SourceType; parsedText: string },
-  providerOptions: Array<{ label: string; description: string; planId?: PlanOption["id"] }>
+  providerOptions: Array<{ label: string; description: string; planId?: PlanOption["id"] }>,
+  previousPlans?: PlanOption[]
 ): PlanOption[] {
   const analysisInput: InputsState = {
     text: input.inputText,
@@ -209,7 +217,14 @@ function mergeProviderPlans(
     parsedText: input.parsedText,
     sourceType: input.sourceType
   };
-  const localOptions = mockGeneratePlanOptions(mockAnalyzeInput(analysisInput));
+  const analysis = mockAnalyzeInput(analysisInput);
+  // When the caller asks to regenerate, base the local seed off the previous
+  // plans so the labels/timings actually shift instead of regressing to the
+  // exact same three options. Without this, regenerate at the chat layer was
+  // a silent no-op for users on the local fallback.
+  const localOptions = previousPlans && previousPlans.length > 0
+    ? mockRegeneratePlanOptions(analysisInput, previousPlans)
+    : mockGeneratePlanOptions(analysis);
 
   // Always return three slots (the UI assumes plan-1/2/3). When the provider
   // only gives 1 or 2 build options we keep the local labels for the rest
@@ -257,7 +272,7 @@ function buildQuestion(result: PlanModeTurnResult): ClarifyingQuestion {
 
 function normalizeAiReplyPayload(
   parsed: Partial<AIReplyPayload>,
-  input: { inputText: string; sourceType: SourceType; parsedText: string }
+  input: { inputText: string; sourceType: SourceType; parsedText: string; regenerate?: boolean; previousPlans?: PlanOption[] }
 ): AIReplyPayload {
   const plans = Array.isArray(parsed.plans)
     ? mergeProviderPlans(
@@ -266,7 +281,8 @@ function normalizeAiReplyPayload(
           label: plan.name,
           description: plan.summary,
           planId: plan.id
-        }))
+        })),
+        input.regenerate ? input.previousPlans : undefined
       )
     : null;
 
