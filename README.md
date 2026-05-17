@@ -1,354 +1,302 @@
 # Next Card
 
-Next Card is a demo-ready Web MVP for turning a one-sentence goal, written plan,
-attachment, notification, or timetable into an AI-planned task card deck.
+Next Card turns a one-sentence goal, written plan, attachment, notification, or
+image timetable into an AI-planned task card deck. The user picks one of three
+execution plans, then completes decomposed action cards through a swipe-driven
+deck. Completion, freeze, burn, reschedule, and reward events get written into
+a proof log so the work becomes visible evidence.
 
-The first implementation pass is now a runnable Next.js app. The app is forced
-into a mobile-only WebView shape so it can later be wrapped as an Android APK.
-The current focus is the `input` experience: a calm Pi-inspired composer, mock
-Plan Mode analysis, three execution plans, task-flow generation, a generated deck
-cover, and an initial proof record.
+It runs as a Next.js (App Router) web app, sized like a single mobile WebView
+so it can later be wrapped into an Android APK without re-doing layout.
 
 ## Run
 
 ```bash
 pnpm install
-pnpm dev
-```
-
-Then open:
-
-```text
-http://127.0.0.1:3000
-```
-
-Before handing off a change, run:
-
-```bash
+pnpm dev          # http://127.0.0.1:3000
 pnpm lint
-pnpm build
+pnpm build        # full Next.js build (server routes included, see below)
 ```
 
-`pnpm build` uses `output: "export"` and produces a static bundle in:
+> Note: `pnpm build` produces a normal Next.js production build with API
+> routes. There is no `output: "export"` and no `out/` directory. If you need
+> a static bundle for an Android APK that only loads HTML/JS, you must add
+> `output: "export"` to `next.config.mjs` and remove the API routes (or stub
+> them out). The current build assumes a Node.js host.
+
+### Optional environment variables
+
+The app degrades gracefully when these are missing — chat falls back to a
+local mock planner, push falls back to no-op, calendar writes to a temp dir.
 
 ```text
-out/
+# Chat / planning
+DEEPSEEK_API_KEY            # if set, /api/chat tries DeepSeek first
+DEEPSEEK_BASE_URL           # defaults to https://api.deepseek.com
+DEEPSEEK_MODEL              # defaults to deepseek-chat
+NEXT_CARD_CHAT_PROVIDER     # "deepseek" | "mimo" (default mimo)
+
+MIMO_API_KEY / MIMO_BASE_URL / MIMO_MODEL  # optional Mimo backend
+                            # When unset, the local plan-mode service is used.
+
+# Web Push (Agent 2 reminders)
+NEXT_CARD_PUSH_VAPID_SUBJECT       # mailto: or https:// URL
+NEXT_CARD_PUSH_VAPID_PUBLIC_KEY
+NEXT_CARD_PUSH_VAPID_PRIVATE_KEY
+NEXT_CARD_PUSH_TTL_SECONDS         # default 3600
+NEXT_CARD_PUSH_SUBSCRIPTIONS_FILE  # JSON file path; default tmpdir
+
+# Queue snapshot persistence
+NEXT_CARD_QUEUE_REPOSITORY  # "memory" or default JSON file
+NEXT_CARD_QUEUE_FILE        # JSON file path; default tmpdir
+
+# ICS calendar export
+NEXT_CARD_CALENDAR_DIR
+NEXT_CARD_CALENDAR_NAME
+NEXT_CARD_CALENDAR_PRODUCT_ID
+NEXT_CARD_CALENDAR_DEFAULT_DURATION_MINUTES   # default 25
+
+NEXT_PUBLIC_APP_URL                # used in push payload `url`
 ```
 
-That folder is the APK WebView handoff artifact if the Android wrapper wants to
-load local assets instead of a hosted URL.
+If you run with none of these set, the app still works end to end against the
+local mock planner and skips push/calendar dispatch.
 
-## Current Stack
+## Stack
 
-- Next.js App Router
+- Next.js 15 App Router (Node runtime for API routes)
 - TypeScript
 - Tailwind CSS
-- Zustand with localStorage persistence
-- Framer Motion
-- lucide-react
-- Playwright as a dev-only smoke-test helper
-
-No real OCR, OpenAI API, backend, auth, reminders, calendar sync, or notification
-service is connected yet.
+- Zustand + `localStorage` persist (schema v4)
+- Framer Motion + lucide-react
+- `web-push` (VAPID) and `ics` (calendar export)
 
 ## Mobile WebView Target
 
-This project is now mobile-only by design.
-
-Web target contract:
+The UI is sized for a single mobile WebView frame. Desktop browsers see a
+centered ~430px preview. There are no desktop two-column layouts and no
+desktop-only breakpoints.
 
 ```text
-lib/webview-contract.ts
+lib/webview-contract.ts    # WebView shape contract
 ```
 
-Current decisions:
-
-- The app renders as a single mobile WebView surface.
-- Desktop browsers only preview a centered `430px` maximum-width app frame.
-- There are no desktop two-column layouts.
-- The root viewport uses `viewport-fit=cover` and CSS safe-area env values.
-- The UI supports practical Android widths from `360px` upward.
-- State persists through `localStorage`, so Android WebView must enable DOM storage.
-- The Next build exports static files for WebView packaging.
-
-Android wrapper requirements:
+Android wrapper requirements when packaging:
 
 ```kotlin
 webView.settings.javaScriptEnabled = true
-webView.settings.domStorageEnabled = true
+webView.settings.domStorageEnabled = true   // Zustand persist needs this
 webView.settings.loadWithOverviewMode = true
 webView.settings.useWideViewPort = true
 ```
 
-If loading the exported app locally, point the WebView at the generated static
-entry after copying `out/` into Android assets. If loading remotely, use an HTTPS
-deployment of the same static export.
+The current Next.js build is **not** a static export. To ship the WebView as
+local APK assets you have two options:
 
-Do not add desktop breakpoints or dashboard-style layouts. Any new page or
-component should be designed inside the same mobile WebView frame first.
+1. Point the WebView at a hosted Next.js deployment (HTTPS).
+2. Add `output: "export"` and stub `app/api/**` routes — chat/import/push are
+   server-only by design.
 
-## Product Modes
+## Modes
 
-The app intentionally exposes exactly three top-level modes:
-
-```text
-input / deck / proof
-```
-
-The mode switch is implemented in:
-
-```text
-app/page.tsx
-components/TopModeTabs.tsx
-```
-
-Do not add a fourth primary mode without revisiting the product contract in
+The app exposes three primary modes — `input / deck / proof` — and nothing
+else. Mode switching is in `app/page.tsx` and `components/TopModeTabs.tsx`.
+Don't add a fourth mode without revisiting the product contract in
 `AGENTS.md`.
 
-The visible app shell is implemented in:
+### input
+
+ChatGPT-style composer that accepts text, document attachments, and image
+timetables. The flow is **understand → ask → plan**, in that order:
+
+- AI replies in `thinking` (gathering) → `asking` (one-question clarify with
+  three options + "按默认理解直接生成方案") → `generating` → `ready` (three
+  execution plans + 否，重新生成).
+- Plans are not emitted while the AI is still in `asking`. Users see the
+  question first, not the plans.
+- The clarification turn budget is a single source of truth in
+  `lib/ai-prompts.ts` (`CLARIFICATION_TURN_BUDGET = 5`); both the `/api/chat`
+  / `/api/ai/clarify` server entries and the frontend store enforce the same
+  cap.
+- "否，重新生成" actually rerolls plan content via `mockRegeneratePlanOptions`
+  on the server (`regenerate: true` is forwarded into `/api/chat`), instead
+  of returning identical labels.
+
+### deck
+
+Reigns-style single-card execution surface.
+
+- Generated decks appear as covers; opening one reveals one card at a time.
+- Cards display title, action, estimated minutes, deadline / suggested-start
+  window, urgency stage, and a time rail on the card itself.
+- Interactions: double-click → start timing (with sparks + WebAudio fallback);
+  triple-click → quick burning mode; left/right swipe or button → complete;
+  down swipe → status bar; deeper down swipe → freeze prompt.
+- Freezing a card writes a `FrozenTaskEntry` (Agent 2 picks it up — see
+  below).
+
+### proof
+
+Visible evidence dashboard.
+
+- Stat cards, colored action table, completion ring, charts.
+- Blog-style flow journal with chronological entries.
+- AI-generated summary document.
+- Records come from plan selection, timing, completion, freezing, burning,
+  reward generation, and freeze-return reminders.
+
+## Two AI Agents
+
+The system has two agents with clear boundaries.
+
+### Agent 1 — Clarification / requirement capture
+
+Takes raw user input and turns it into a structured target the planner can
+build cards from. Lives in:
 
 ```text
-app/page.tsx
-app/globals.css
-app/layout.tsx
+app/api/chat/route.ts
+app/api/ai/clarify/route.ts
+lib/server/plan-mode-service.ts
+lib/server/compat-ai-service.ts
+components/input/InputComposer.tsx (ChatPanel / ClarifyingPanel / GeneratingPanel / PlanChoicePanel)
+store/useNextCardStore.ts (requestAiTurn, clarifyingQuestion, plans)
 ```
 
-Keep this shell mobile-only. If a teammate needs a desktop demo, use the centered
-preview frame rather than adding separate desktop UI.
+Responsibilities:
 
-## Page Interface Contracts
+- Detect missing information (`missingInformation`) before building.
+- Drive the four-phase loop above.
+- Honor the 5-round budget; force `ready` once it's exhausted.
+- Provider order: `NEXT_CARD_CHAT_PROVIDER` → DeepSeek (if `DEEPSEEK_API_KEY`
+  is set) → Mimo (if configured) → local fallback.
 
-Page contracts live in:
+### Agent 2 — Time scheduling and push
+
+Owns the entire "what should fire when, and how do we tell the user" surface.
+Sub-modules:
+
+- **Freeze-return reminders** — when a user freezes a card, compute
+  `returnAfter` (deadline-30min → suggestedStart → now+90min) and remind them
+  to come back. `components/FreezeReturnScheduler.tsx` is the client-side
+  driver: it (re-)registers a `setTimeout` per pending entry on every store
+  change, calls `triggerFreezeReturn` at the deadline, and POSTs a
+  `dispatch: true` worker tick so Web Push fires too.
+- **Priority sorting** — `lib/server/priority-engine.ts` +
+  `lib/server/schedule-planner.ts`. Reads behavior vector / deadline / time
+  locks / freeze age and produces `QueueAction[]`.
+- **Reminder & calendar sync** — when the user opts in (`reminderSync` /
+  `calendarSync` set to `wanted` or `synced`), the planner produces
+  `create-reminder` / `create-calendar-event` actions. Pure urgency-driven
+  reminders without an opt-in are flagged `requiresUserReview: true` so
+  `lib/server/provider-dispatch.ts` skips them instead of silently pushing.
+- **Hidden goal reveal** — hidden future tasks only surface as
+  `reveal-hidden-goal` actions when their priority crosses a threshold, and
+  always with `requiresUserReview: true`.
+- **ICS export** — `lib/server/providers/ics-calendar-provider.ts`.
+
+Files:
 
 ```text
-lib/page-contracts.ts
+lib/server/agent-runtime.ts            # skill registry + runtime guard
+lib/server/backend-worker.ts           # worker tick orchestration
+lib/server/schedule-planner.ts
+lib/server/priority-engine.ts
+lib/server/freeze-return-agent.ts
+lib/server/freeze-sweep.ts
+lib/server/schedule-agent.ts           # AgentScheduleAction compat surface
+lib/server/provider-dispatch.ts
+lib/server/providers/web-push-notification-provider.ts
+lib/server/providers/ics-calendar-provider.ts
+components/FreezeReturnScheduler.tsx   # client-side timer driver
 ```
 
-That file defines the handoff interfaces for each mode:
+Safety properties enforced:
 
-- `InputPagePort`
-- `DeckPagePort`
-- `ProofPagePort`
-- `PAGE_CONTRACTS`
-- `NEXT_IMPLEMENTATION_BACKLOG`
+- `worker tick` route accepts client snapshots in **preview mode** by default
+  (`persist: false`, `dispatch: false`). It will not overwrite the server
+  queue snapshot or push to subscribers unless the caller explicitly opts in.
+- `provider-dispatch` skips any action with `requiresUserReview: true`.
+- `applyAgentRuntimeGuard` (in `agent-runtime.ts`) filters QueueAction kinds
+  against the trigger's allowlist — e.g. a `worker-tick` cannot mint a
+  `reveal-hidden-goal` that bypasses review.
+- Hard time locks (`canAgentMove: false`) only generate suggestions, never
+  silent moves.
 
-Use these as the source of truth when adding the next feature. If a new action is
-added to a page, add or update the corresponding action contract there first.
-
-## Input Page Contract
-
-Status: mostly implemented.
-
-Owner files:
+## API Routes
 
 ```text
-components/input/InputComposer.tsx
-components/input/PlanModePanel.tsx
-components/input/PlanOptionCard.tsx
-components/flow/TaskFlowOverview.tsx
-lib/mock-ai.ts
-store/useNextCardStore.ts
+POST /api/chat                       # streamed-style structured chat (DeepSeek/Mimo/local)
+POST /api/ai/clarify                 # one-shot clarification turn
+POST /api/ai/parse                   # multimodal import parser
+POST /api/ai/plan                    # compat planning bundle (analysis + 3 plans + deck + flow)
+POST /api/agent/schedule             # validate AgentScheduleAction, return QueueAction
+POST /api/backend/worker/tick        # run priority engine + freeze sweep (preview by default)
+POST /api/backend/freeze/return      # analyzeFrozenTaskReturn for one entry
+POST /api/backend/schedule/plan      # standalone schedule plan
+GET  /api/backend/push/public-key    # VAPID public key (or `configured: false`)
+POST /api/backend/push/subscriptions # register a Web Push subscription
+POST /api/backend/push/send          # dispatch a single QueueAction
+POST /api/backend/import/review      # large-import review gate
+POST /api/backend/calendar/events    # ICS calendar event create/update
+GET  /api/backend/health             # health probe
+POST /api/backend/proof/export       # proof export
+POST /api/proof/export               # proof export (legacy alias)
+POST /api/backend/plan-mode          # plan-mode pass-through
 ```
 
-Current behavior:
+## State and Types
 
-- Accepts text goals.
-- Adds mock attachment text.
-- Adds mock image timetable text.
-- Shows an analysis state before plan options.
-- Extracts mock time information.
-- Generates exactly three plans.
-- Supports `否，重新生成`.
-- Selecting a plan creates a task flow, deck entry, and first proof record.
+Shared types: `lib/types.ts`. Zustand store: `store/useNextCardStore.ts`.
 
-Main actions:
+The store owns: `mode`, `inputs`, `analysis`, `plans`, `taskFlow`, `deck`
+(including the `frozenTasks` ledger), `proofs`, plus the chat/clarify state
+machine.
 
-- `submitInput`
-- `regeneratePlans`
-- `selectPlan`
+Persistence schema is at version 4. v3 → v4 migration backfills
+`deck.frozenTasks: []` so old localStorage state still loads.
 
-Next work:
+When adding a feature, prefer adding a named store action over mutating
+nested state inside a UI component.
 
-- Keep mock planning stable while the deck interaction is built.
-- Later replace `mockAnalyzeInput` and plan generation with a real planning API.
-- When real OCR arrives, connect it through the existing `imageSchedule` and
-  `parsedText` fields instead of creating a separate page.
+## Mock AI
 
-## Deck Page Contract
-
-Status: partial.
-
-Owner files:
+Local fallbacks live in `lib/mock-ai.ts`:
 
 ```text
-components/deck/DeckLibrary.tsx
-components/deck/CardTimeUI.tsx
-store/useNextCardStore.ts
-lib/mock-ai.ts
+mockAnalyzeInput
+mockGeneratePlanOptions
+mockRegeneratePlanOptions
+mockGenerateClarifyingQuestion
+mockGenerateThinkingSteps
+mockGenerateTaskFlow
+mockGenerateDeckFromPlan
+mockGenerateTimePlanForCard
+mockUpdateCardUrgency
+mockRescheduleFrozenCard
+mockGenerateProofSummary
 ```
 
-Current behavior:
+These remain deterministic and feed both the offline path and the always-three
+plan slots in the API responses, so the UI never sees fewer than three plans.
 
-- Shows generated deck covers.
-- Opens a deck.
-- Shows one active card execution surface.
-- Shows estimated time, remaining window, urgency stage, and a time rail.
-- `去高数课` creates a course-style deck with a near-deadline burning demo card.
-- Double click starts timing with sparks and WebAudio fallback.
-- Triple click or the burn button starts quick burning mode.
-- Left/right drag or completion button completes the current card and writes proof.
-- Down drag reveals the status bar.
-- Deeper down drag or freeze button opens the freeze prompt and writes proof.
+## Suggested Next PRs
 
-Implemented interfaces:
+1. Wire a real Service Worker registration so Web Push actually delivers in
+   the browser (the server side is wired; the client subscribe step is not).
+2. Add a periodic server-side worker tick (Vercel cron or a small Node
+   scheduler) so freeze returns and urgency thresholds fire even when the
+   tab is closed.
+3. Persist `agentDecision`/`requiresUserReview` actions to a real review
+   queue surface in `proof` so users can approve queued reminders.
+4. On-device WebView tuning: drag thresholds, double/triple-click, WebAudio,
+   safe-area, native back button.
 
-- `openDeck`
-- `completeCurrentCard`
-- `revealStatusBar`
-- `requestFreezeCurrentCard`
-- `startFocusTiming`
-- `startQuickBurning`
+## Known Worktree Notes
 
-Next work:
-
-1. Tune drag thresholds on a physical Android WebView.
-2. Add a real resume screen for `rescheduleQueue`.
-3. Extract `BurnTimer` if the burn countdown becomes more detailed.
-4. Improve reward-card transition after a full deck completes.
-
-Recommended component files to add next:
-
-```text
-components/deck/BurnTimer.tsx
-```
-
-## Proof Page Contract
-
-Status: partial.
-
-Owner files:
-
-```text
-components/proof/ProofDashboard.tsx
-store/useNextCardStore.ts
-lib/mock-ai.ts
-```
-
-Current behavior:
-
-- Shows proof stat cards.
-- Shows a colored action table as mobile proof cards.
-- Shows progress charts and a completion ring.
-- Shows a readable summary document.
-- Shows a proof03-style manually scrollable flow journal with fade edges.
-- Receives records from plan selection, timing, burning, completion, freezing, and reward generation.
-
-Interfaces left for the next teammate:
-
-- `renderProofDashboard`
-- `refreshSummary`
-- `exportSummaryDocument`
-
-Next work:
-
-1. Split `ProofDashboard` into smaller components when the next proof iteration grows:
-   ```text
-   components/proof/ProofTable.tsx
-   components/proof/ProofCharts.tsx
-   components/proof/FlowJournal.tsx
-   components/proof/JournalEntry.tsx
-   components/proof/SummaryDocument.tsx
-   ```
-2. Add richer heat blocks once multiple days exist.
-3. Add copy/export behavior for the summary document if needed for demos.
-
-## Mock AI Contract
-
-All mock AI lives in:
-
-```text
-lib/mock-ai.ts
-```
-
-Current functions:
-
-- `mockAnalyzeInput`
-- `mockGeneratePlanOptions`
-- `mockRegeneratePlanOptions`
-- `mockGenerateTaskFlow`
-- `mockGenerateDeckFromPlan`
-- `mockGenerateTimePlanForCard`
-- `mockUpdateCardUrgency`
-- `mockRescheduleFrozenCard`
-- `mockGenerateProofSummary`
-
-Keep these deterministic. The MVP should feel smart, but it should not call real
-AI services yet.
-
-## State Contract
-
-Shared types live in:
-
-```text
-lib/types.ts
-```
-
-Zustand store lives in:
-
-```text
-store/useNextCardStore.ts
-```
-
-The store currently owns:
-
-- `mode`
-- `inputs`
-- `analysis`
-- `plans`
-- `taskFlow`
-- `deck`
-- `proofs`
-
-When adding a feature, prefer adding a named store action instead of mutating
-nested state directly inside UI components.
-
-## Suggested Next PR
-
-Tune the deck execution surface on real mobile WebView.
-
-Minimum scope:
-
-1. Install the static `out/` bundle in an Android WebView wrapper.
-2. Test drag thresholds, double click, triple click, and WebAudio on device.
-3. Add native back-button handling for `input / deck / proof` mode history.
-4. Add a resume screen for frozen cards in `rescheduleQueue`.
-5. Run `pnpm lint` and `pnpm build`.
-
-Do not start real OCR, OpenAI API, backend, reminders, or calendar sync until the
-mock deck loop is complete and demo-stable.
-
-## Suggested APK Wrapper Work
-
-This repo only ships the WebView page. Android packaging should happen in a
-separate native wrapper project or a later `android/` folder.
-
-Recommended Android-side steps:
-
-1. Run `pnpm build`.
-2. Copy `out/` into Android assets or deploy it to HTTPS.
-3. Create a single-Activity WebView wrapper.
-4. Enable JavaScript and DOM storage.
-5. Load the local `index.html` or hosted URL.
-6. Set the status/navigation bar colors to match `#fbf1ea`.
-7. Preserve safe-area/inset behavior and avoid injecting desktop viewport rules.
-8. Later add a bridge only for reminders, calendar, notifications, sound, and
-   native back-button behavior.
-
-## Known Dirty Worktree Note
-
-The repository may already show deleted static proof preview files and an
-`archive/` folder from earlier prototype cleanup. Those are unrelated to the
-current app implementation. Do not restore or delete them unless the owner asks.
+- `proof-03.html` is a static design reference, not part of the build.
+- The repository previously contained an `archive/` folder from prototype
+  cleanup; ignore unless the owner asks.
 
 ## License
 
